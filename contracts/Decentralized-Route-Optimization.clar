@@ -11,6 +11,8 @@
 (define-constant ERR-INVALID-ROUTE (err u103))
 (define-constant ERR-INSUFFICIENT-BALANCE (err u104))
 (define-constant ERR-UNAUTHORIZED (err u105))
+(define-constant ERR-NOT-SHARED (err u106))
+(define-constant ERR-ALREADY-REUSED (err u107))
 
 (define-constant MIN-DISTANCE u1)
 (define-constant MAX-DISTANCE u10000)
@@ -18,6 +20,7 @@
 (define-constant MAX-TIME u14400)
 (define-constant BASE-REWARD u100)
 (define-constant EFFICIENCY-MULTIPLIER u10)
+(define-constant SHARING-REWARD-PERCENTAGE u20)
 
 ;; data vars
 (define-data-var total-routes uint u0)
@@ -72,6 +75,21 @@
 (define-map route-history
     principal
     (list 100 uint)
+)
+
+(define-map shared-routes
+    uint
+    {
+        is-shared: bool,
+        shared-by: principal,
+        reuse-count: uint,
+        total-sharing-rewards: uint
+    }
+)
+
+(define-map route-reuse-tracking
+    {route-id: uint, reuser: principal}
+    bool
 )
 
 ;; public functions
@@ -240,6 +258,72 @@
     )
 )
 
+(define-public (share-route (route-id uint))
+    (let 
+        (
+            (caller tx-sender)
+            (route-data (unwrap! (map-get? routes route-id) ERR-NOT-FOUND))
+        )
+        (asserts! (is-eq caller (get driver route-data)) ERR-UNAUTHORIZED)
+        (asserts! (is-none (map-get? shared-routes route-id)) ERR-ALREADY-EXISTS)
+        
+        (map-set shared-routes route-id
+            {
+                is-shared: true,
+                shared-by: caller,
+                reuse-count: u0,
+                total-sharing-rewards: u0
+            }
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (reuse-shared-route (route-id uint))
+    (let 
+        (
+            (caller tx-sender)
+            (route-data (unwrap! (map-get? routes route-id) ERR-NOT-FOUND))
+            (shared-data (unwrap! (map-get? shared-routes route-id) ERR-NOT-SHARED))
+            (original-driver (get driver route-data))
+            (original-driver-info (unwrap! (map-get? drivers original-driver) ERR-NOT-FOUND))
+            (reuse-key {route-id: route-id, reuser: caller})
+            (sharing-reward (/ (* (get reward-earned route-data) SHARING-REWARD-PERCENTAGE) u100))
+        )
+        (asserts! (is-some (map-get? drivers caller)) ERR-NOT-FOUND)
+        (asserts! (not (is-eq caller original-driver)) ERR-UNAUTHORIZED)
+        (asserts! (is-none (map-get? route-reuse-tracking reuse-key)) ERR-ALREADY-REUSED)
+        
+        (map-set route-reuse-tracking reuse-key true)
+        
+        (map-set shared-routes route-id
+            (merge shared-data
+                {
+                    reuse-count: (+ (get reuse-count shared-data) u1),
+                    total-sharing-rewards: (+ (get total-sharing-rewards shared-data) sharing-reward)
+                }
+            )
+        )
+        
+        (map-set driver-balances original-driver 
+            (+ (default-to u0 (map-get? driver-balances original-driver)) sharing-reward)
+        )
+        
+        (map-set drivers original-driver
+            (merge original-driver-info
+                {
+                    total-rewards: (+ (get total-rewards original-driver-info) sharing-reward)
+                }
+            )
+        )
+        
+        (var-set reward-pool (- (var-get reward-pool) sharing-reward))
+        
+        (ok sharing-reward)
+    )
+)
+
 ;; read only functions
 (define-read-only (get-driver-info (driver principal))
     (map-get? drivers driver)
@@ -296,6 +380,14 @@
         )
         (ok (get efficiency-score route-data))
     )
+)
+
+(define-read-only (get-shared-route-info (route-id uint))
+    (map-get? shared-routes route-id)
+)
+
+(define-read-only (has-reused-route (route-id uint) (driver principal))
+    (default-to false (map-get? route-reuse-tracking {route-id: route-id, reuser: driver}))
 )
 
 ;; private functions
